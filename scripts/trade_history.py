@@ -47,9 +47,16 @@ class State:
 # ---------- Helpers ----------
 
 def parse_user_dt_local(s: str, tz: ZoneInfo) -> datetime:
-    # Format: yy-mm-dd:hh-mm (interpreted in provided timezone)
-    dt_local = datetime.strptime(s, "%y-%m-%d:%H:%M")
-    return dt_local.replace(tzinfo=tz)
+    # Supported formats (interpreted in provided timezone):
+    # - Preferred: yy-mm-dd_hh:mm (e.g., 25-08-19_23:14)
+    # - Legacy:    yy-mm-dd:hh:mm (e.g., 25-08-19:23:14)
+    for fmt in ("%y-%m-%d_%H:%M", "%y-%m-%d:%H:%M"):
+        try:
+            dt_local = datetime.strptime(s, fmt)
+            return dt_local.replace(tzinfo=tz)
+        except ValueError:
+            continue
+    raise ValueError("Time format must be 'yy-mm-dd_hh:mm' (preferred) or 'yy-mm-dd:hh:mm'")
 
 
 def floor_to_qty_unit(qty: float, unit: float) -> float:
@@ -81,7 +88,7 @@ def log_event(st: State, events: List[dict], candle_ts_utc: pd.Timestamp, tz: Zo
 # (Placement logs for orders are currently disabled by user edits)
 
 
-def place_initial_ladder(cfg: Config, st: State, events: List[dict], candle_ts_utc: pd.Timestamp) -> None:
+def place_initial_ladder(cfg: Config, st: State, _events: List[dict], _candle_ts_utc: pd.Timestamp) -> None:
     for i in range(cfg.ladder_rungs):
         rung_price = q_price(cfg.first_ladder_price - i * cfg.tick_size)
         if rung_price <= 0:
@@ -232,8 +239,13 @@ def load_and_slice_data(data_path: str, start_dt_utc: datetime, end_dt_utc: date
     if not str(data_path).endswith(".csv.gz"):
         raise ValueError("Input dataset must be gzip-compressed with .csv.gz")
     df = pd.read_csv(data_path)
+    # Support KST-preferred datasets with 'timestamp_kst' string column.
+    # If present, derive UTC from it for internal simulation.
+    if "timestamp_kst" in df.columns:
+        kst_ts = pd.to_datetime(df["timestamp_kst"], format="%Y-%m-%d %H:%M:%S", errors="coerce").dt.tz_localize("Asia/Seoul", nonexistent="shift_forward", ambiguous="NaT")
+        df["timestamp_utc"] = kst_ts.dt.tz_convert("UTC")
     if "timestamp_utc" not in df.columns:
-        raise ValueError("Dataset missing 'timestamp_utc' column")
+        raise ValueError("Dataset missing 'timestamp_utc' column (and 'timestamp_kst' not parseable)")
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
     mask = (df["timestamp_utc"] >= start_dt_utc) & (df["timestamp_utc"] < end_dt_utc)
     sliced = df.loc[mask].copy()
@@ -246,9 +258,12 @@ def load_and_slice_data(data_path: str, start_dt_utc: datetime, end_dt_utc: date
 
 
 def load_and_slice_df(df: pd.DataFrame, start_dt_utc: datetime, end_dt_utc: datetime) -> pd.DataFrame:
-    if "timestamp_utc" not in df.columns:
-        raise ValueError("DataFrame missing 'timestamp_utc' column")
     df2 = df.copy()
+    if "timestamp_kst" in df2.columns and "timestamp_utc" not in df2.columns:
+        kst_ts = pd.to_datetime(df2["timestamp_kst"], format="%Y-%m-%d %H:%M:%S", errors="coerce").dt.tz_localize("Asia/Seoul", nonexistent="shift_forward", ambiguous="NaT")
+        df2["timestamp_utc"] = kst_ts.dt.tz_convert("UTC")
+    if "timestamp_utc" not in df2.columns:
+        raise ValueError("DataFrame missing 'timestamp_utc' column (and 'timestamp_kst' not parseable)")
     df2["timestamp_utc"] = pd.to_datetime(df2["timestamp_utc"], utc=True)
     mask = (df2["timestamp_utc"] >= start_dt_utc) & (df2["timestamp_utc"] < end_dt_utc)
     sliced = df2.loc[mask].copy()
@@ -375,11 +390,11 @@ def run_trade_history(
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Produce detailed trade history for a fixed TICK size (times in KST)")
     p.add_argument("--data", default=os.path.join("data", "upbit", "krw-xrp_1s_last3m.csv.gz"))
-    p.add_argument("--from", dest="from_s", required=True, help="Start (yy-mm-dd:hh-mm) in KST")
-    p.add_argument("--to", dest="to_s", required=True, help="End (yy-mm-dd:hh-mm) in KST")
+    p.add_argument("--from", dest="from_s", required=True, help="Start (yy-mm-dd_hh:mm, or yy-mm-dd:hh:mm) in KST")
+    p.add_argument("--to", dest="to_s", required=True, help="End (yy-mm-dd_hh:mm, or yy-mm-dd:hh:mm) in KST")
     p.add_argument("--tick", type=int, required=True, help="TICK size in KRW")
     p.add_argument("--first-ladder-price", type=float, required=True, help="First ladder buy price (KRW)")
-    p.add_argument("--maker-fee", type=float, default=0.0002)
+    p.add_argument("--maker-fee", type=float, default=0.0002, help="Maker fee rate (e.g., 0.0002 for 0.02%)")
     p.add_argument("--ladder-rungs", type=int, default=4)
     p.add_argument("--order-krw", type=float, default=10000.0)
     p.add_argument("--min-order-krw", type=float, default=5000.0)
@@ -405,7 +420,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         tz='Asia/Seoul',
     )
 
-    print(hist.head(30).to_string(index=False)) if not hist.empty else print("No events generated.")
+    if not hist.empty:
+        print(hist.head(30).to_string(index=False))
+    else:
+        print("No events generated.")
     print(
         f"\nSummary: realized={metrics['realized_pnl_krw']:.2f} KRW, unrealized={metrics['unrealized_pnl_krw']:.2f} KRW, total={metrics['total_pnl_krw']:.2f} KRW, end_inventory_qty={metrics['end_inventory_qty']:.4f}"
     )

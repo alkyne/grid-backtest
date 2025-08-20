@@ -3,7 +3,6 @@
 
 import argparse
 import os
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
@@ -49,23 +48,25 @@ def fetch_seconds_candles(
     count: int,
     timeout: float,
 ) -> List[dict]:
-    # Try query-param style first: /v1/candles/seconds?unit=1
-    params = {"market": market, "count": int(count), "unit": int(unit_seconds)}
+    # Prefer the documented path-parameter style first
+    url_path = f"{API_BASE_SECONDS}/{unit_seconds}"
+    params = {"market": market, "count": int(count)}
     if to_dt is not None:
         params["to"] = format_to_param(to_dt)
 
-    resp = session.get(API_BASE_SECONDS, params=params, timeout=timeout)
-
-    # Fallback to path-param style on 404 (or 405/400 just in case)
-    if resp.status_code == 404:
-        url_fallback = f"{API_BASE_SECONDS}/{unit_seconds}"
-        params_fb = {"market": market, "count": int(count)}
+    resp = session.get(url_path, params=params, timeout=timeout)
+    if resp.status_code in (404, 405, 400):
+        # Fallback to query-param style if path style is unavailable
+        params_q = {"market": market, "count": int(count), "unit": int(unit_seconds)}
         if to_dt is not None:
-            params_fb["to"] = format_to_param(to_dt)
-        resp = session.get(url_fallback, params=params_fb, timeout=timeout)
+            params_q["to"] = format_to_param(to_dt)
+        resp = session.get(API_BASE_SECONDS, params=params_q, timeout=timeout)
 
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    if not isinstance(data, list):
+        raise ValueError(f"Unexpected response payload (not a list): {type(data)}")
+    return data
 
 
 def normalize_records(records: List[dict], market: str, unit_seconds: int) -> pd.DataFrame:
@@ -104,10 +105,14 @@ def normalize_records(records: List[dict], market: str, unit_seconds: int) -> pd
     df["market"] = market
     df["unit_seconds"] = int(unit_seconds)
 
+    # Add KST column first for KST-preferred datasets
+    kst_series = df["timestamp_utc"].dt.tz_convert("Asia/Seoul")
+    df["timestamp_kst"] = kst_series.dt.strftime("%Y-%m-%d %H:%M:%S")
+
     df = df.drop_duplicates(subset=["timestamp_utc"]).sort_values("timestamp_utc").reset_index(drop=True)
 
     preferred_cols = [
-        "timestamp_utc",
+        "timestamp_kst",
         "market",
         "unit_seconds",
         "open",
@@ -116,6 +121,7 @@ def normalize_records(records: List[dict], market: str, unit_seconds: int) -> pd
         "close",
         "volume",
         "quote_volume",
+        "timestamp_utc",
     ]
     remaining = [c for c in df.columns if c not in preferred_cols]
     df = df[preferred_cols + remaining]
@@ -156,7 +162,7 @@ def download_seconds_range(
         except requests.HTTPError as http_err:
             print(f"HTTP error: {http_err}")
             break
-        except Exception as exc:
+        except (requests.ConnectionError, requests.Timeout) as exc:
             print(f"Request failed: {exc}")
             break
 
@@ -197,14 +203,27 @@ def download_seconds_range(
         return out_path
 
     df = normalize_records(all_records, market=market, unit_seconds=unit_seconds)
-
     df = df[df["timestamp_utc"] >= pd.Timestamp(start_dt)].reset_index(drop=True)
 
+    # Atomic write to avoid corrupted CSV/GZ on interruption
     compression = "gzip" if out_path.endswith(".gz") else None
-    df.to_csv(out_path, index=False, compression=compression)
+    tmp_path = out_path + ".tmp"
+    try:
+        df.to_csv(tmp_path, index=False, compression=compression)
+        os.replace(tmp_path, out_path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
 
+    kst_min = df["timestamp_utc"].dt.tz_convert("Asia/Seoul").min().strftime("%Y-%m-%d %H:%M:%S")
+    kst_max = df["timestamp_utc"].dt.tz_convert("Asia/Seoul").max().strftime("%Y-%m-%d %H:%M:%S")
     print(
-        f"Saved {len(df):,} rows to {out_path}. Range: {df['timestamp_utc'].min()} .. {df['timestamp_utc'].max()}"
+        f"Saved {len(df):,} rows to {out_path}.\n"
+        f"KST range: {kst_min} .. {kst_max}\n"
+        f"UTC range: {df['timestamp_utc'].min()} .. {df['timestamp_utc'].max()}"
     )
     return out_path
 
@@ -262,7 +281,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted by user")
         return 130
-    except Exception as exc:
+    except (requests.HTTPError, requests.ConnectionError, requests.Timeout, ValueError) as exc:
         print(f"Failed: {exc}")
         return 1
     return 0
