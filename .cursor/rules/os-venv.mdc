@@ -1,0 +1,3 @@
+alwaysApply: true
+- When running commands in a terminal, check OS and
+  ensure that the Python virtual environment located at ~/venv/bin/activate is activated first.
