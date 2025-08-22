@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 
+"""
+python scripts/trade_history.py \
+  --data data/upbit/krw-xrp_1s_last3m.csv.gz \
+  --symbol xrp \
+  --from 25-08-19_23:14 \
+  --to 25-08-20_16:14 \
+  --price_gap 10 \
+  --first-ladder-price 4160 \
+  --ladder-rungs 30 --order-krw 10100 \
+  --out trade_result_xrp_4160_10_25-08-19_23:14_25-08-20_16:14.csv
+"""
+
 import argparse
 import math
 import os
@@ -17,11 +29,11 @@ class Config:
     start_dt_utc: datetime
     end_dt_utc: datetime
     tz: ZoneInfo
-    tick_size: int
+    price_gap: int
     first_ladder_price: float
     maker_fee_rate: float = 0.0002  # 0.02%
     min_order_krw: float = 5000.0
-    qty_unit: float = 0.0001
+    qty_unit: float = 0.00000001
     ladder_rungs: int = 4
     order_krw_per_buy: float = 10000.0
 
@@ -90,7 +102,7 @@ def log_event(st: State, events: List[dict], candle_ts_utc: pd.Timestamp, tz: Zo
 
 def place_initial_ladder(cfg: Config, st: State, _events: List[dict], _candle_ts_utc: pd.Timestamp) -> None:
     for i in range(cfg.ladder_rungs):
-        rung_price = q_price(cfg.first_ladder_price - i * cfg.tick_size)
+        rung_price = q_price(cfg.first_ladder_price - i * cfg.price_gap)
         if rung_price <= 0:
             continue
         qty = floor_to_qty_unit(cfg.order_krw_per_buy / rung_price, cfg.qty_unit)
@@ -101,7 +113,7 @@ def place_initial_ladder(cfg: Config, st: State, _events: List[dict], _candle_ts
 
 
 def on_buy_fill(cfg: Config, st: State, events: List[dict], candle_ts_utc: pd.Timestamp, price: int, qty: float) -> None:
-    fee_krw = price * qty * cfg.maker_fee_rate
+    fee_krw = round(price * qty * cfg.maker_fee_rate, 2)
     st.inventory.append(Lot(qty=qty, price=float(price), buy_fee_krw_remaining=fee_krw))
 
     log_event(
@@ -109,6 +121,7 @@ def on_buy_fill(cfg: Config, st: State, events: List[dict], candle_ts_utc: pd.Ti
         event_type="BUY_FILL",
         price=price,
         qty=qty,
+        notional_krw=price * qty,
         fee_krw=fee_krw,
         realized_pnl_krw=0.0,
         cumulative_realized_pnl_krw=st.realized_pnl_krw,
@@ -116,7 +129,7 @@ def on_buy_fill(cfg: Config, st: State, events: List[dict], candle_ts_utc: pd.Ti
         filled_at=format_ts(candle_ts_utc, cfg.tz),
     )
 
-    target = q_price(price + cfg.tick_size)
+    target = q_price(price + cfg.price_gap)
     st.sell_buckets[target] = st.sell_buckets.get(target, 0.0) + qty
     if st.sell_buckets[target] * target >= cfg.min_order_krw:
         place_qty = floor_to_qty_unit(st.sell_buckets[target], cfg.qty_unit)
@@ -130,35 +143,48 @@ def on_sell_fill(cfg: Config, st: State, events: List[dict], candle_ts_utc: pd.T
     remaining = qty
     realized_for_this_fill = 0.0
     while remaining > 0 and st.inventory:
-        lot = st.inventory[0]
+        expected_buy_price = float(price - cfg.price_gap)
+        match_idx = None
+        for i, lot_iter in enumerate(st.inventory):
+            # exact int price match by rung
+            if int(lot_iter.price) == int(expected_buy_price):
+                match_idx = i
+                break
+        if match_idx is None:
+            # Fallback to FIFO if no exact rung match is found
+            match_idx = 0
+        lot = st.inventory[match_idx]
         take = min(lot.qty, remaining)
         if lot.qty > 0:
             buy_fee_part = lot.buy_fee_krw_remaining * (take / lot.qty)
         else:
             buy_fee_part = 0.0
         lot.buy_fee_krw_remaining = max(0.0, lot.buy_fee_krw_remaining - buy_fee_part)
-        sell_fee_krw = price * take * cfg.maker_fee_rate
-        pnl = (price - lot.price) * take - (buy_fee_part + sell_fee_krw)
+        # Tick profit floored to KRW, fees rounded to two decimals
+        tick_profit_krw = math.floor(cfg.price_gap * take)
+        sell_fee_krw = round(price * take * cfg.maker_fee_rate, 2)
+        pnl = tick_profit_krw - (buy_fee_part + sell_fee_krw)
         realized_for_this_fill += pnl
         st.realized_pnl_krw += pnl
         lot.qty -= take
         remaining -= take
         if lot.qty <= 0:
-            st.inventory.pop(0)
+            st.inventory.pop(match_idx)
 
     log_event(
         st, events, candle_ts_utc, cfg.tz,
         event_type="SELL_FILL",
         price=price,
         qty=qty,
-        fee_krw=price * qty * cfg.maker_fee_rate,
+        notional_krw=price * qty,
+        fee_krw=round(price * qty * cfg.maker_fee_rate, 2),
         realized_pnl_krw=realized_for_this_fill,
         cumulative_realized_pnl_krw=st.realized_pnl_krw,
         inventory_qty_after=sum(l.qty for l in st.inventory),
         filled_at=format_ts(candle_ts_utc, cfg.tz),
     )
 
-    target = q_price(price - cfg.tick_size)
+    target = q_price(price - cfg.price_gap)
     if target > 0:
         st.buy_buckets[target] = st.buy_buckets.get(target, 0.0) + qty
         if st.buy_buckets[target] * target >= cfg.min_order_krw:
@@ -279,13 +305,14 @@ def run_trade_history_df(
     df: pd.DataFrame,
     start_local: str,
     end_local: str,
-    tick_size: int,
     first_ladder_price: float,
+    price_gap: Optional[int] = None,
+    tick_size: Optional[int] = None,
     maker_fee: float = 0.0002,
     ladder_rungs: int = 4,
     order_krw: float = 10000.0,
     min_order_krw: float = 5000.0,
-    qty_unit: float = 0.0001,
+    qty_unit: float = 0.00000001,
     tz: str = 'Asia/Seoul',
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     tzinfo = ZoneInfo(tz)
@@ -294,12 +321,17 @@ def run_trade_history_df(
     if not (end_dt_local > start_dt_local):
         raise ValueError("End must be after start")
 
+    if price_gap is None and tick_size is None:
+        raise ValueError("Must provide either price_gap or tick_size")
+    if price_gap is None:
+        price_gap = int(tick_size)  # type: ignore[arg-type]
+
     cfg = Config(
         data_path="<in-memory>",
         start_dt_utc=start_dt_local.astimezone(timezone.utc),
         end_dt_utc=end_dt_local.astimezone(timezone.utc),
         tz=tzinfo,
-        tick_size=tick_size,
+        price_gap=price_gap,
         first_ladder_price=first_ladder_price,
         maker_fee_rate=maker_fee,
         min_order_krw=min_order_krw,
@@ -335,13 +367,14 @@ def run_trade_history(
     data_path: str,
     start_local: str,
     end_local: str,
-    tick_size: int,
     first_ladder_price: float,
+    price_gap: Optional[int] = None,
+    tick_size: Optional[int] = None,
     maker_fee: float = 0.0002,
     ladder_rungs: int = 4,
     order_krw: float = 10000.0,
     min_order_krw: float = 5000.0,
-    qty_unit: float = 0.0001,
+    qty_unit: float = 0.00000001,
     tz: str = 'Asia/Seoul',
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     tzinfo = ZoneInfo(tz)
@@ -350,12 +383,17 @@ def run_trade_history(
     if not (end_dt_local > start_dt_local):
         raise ValueError("End must be after start")
 
+    if price_gap is None and tick_size is None:
+        raise ValueError("Must provide either price_gap or tick_size")
+    if price_gap is None:
+        price_gap = int(tick_size)  # type: ignore[arg-type]
+
     cfg = Config(
         data_path=data_path,
         start_dt_utc=start_dt_local.astimezone(timezone.utc),
         end_dt_utc=end_dt_local.astimezone(timezone.utc),
         tz=tzinfo,
-        tick_size=tick_size,
+        price_gap=price_gap,
         first_ladder_price=first_ladder_price,
         maker_fee_rate=maker_fee,
         min_order_krw=min_order_krw,
@@ -392,13 +430,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--data", default=os.path.join("data", "upbit", "krw-xrp_1s_last3m.csv.gz"))
     p.add_argument("--from", dest="from_s", required=True, help="Start (yy-mm-dd_hh:mm, or yy-mm-dd:hh:mm) in KST")
     p.add_argument("--to", dest="to_s", required=True, help="End (yy-mm-dd_hh:mm, or yy-mm-dd:hh:mm) in KST")
-    p.add_argument("--tick", type=int, required=True, help="TICK size in KRW")
+    p.add_argument("--price_gap", type=int, required=True, help="TICK size in KRW")
     p.add_argument("--first-ladder-price", type=float, required=True, help="First ladder buy price (KRW)")
     p.add_argument("--maker-fee", type=float, default=0.0002, help="Maker fee rate (e.g., 0.0002 for 0.02%)")
     p.add_argument("--ladder-rungs", type=int, default=4)
     p.add_argument("--order-krw", type=float, default=10000.0)
     p.add_argument("--min-order-krw", type=float, default=5000.0)
-    p.add_argument("--qty-unit", type=float, default=0.0001)
+    # p.add_argument("--qty-unit", type=float, default=0.00000001)
+    p.add_argument("--symbol", default=None, help="Optional symbol token (e.g., xrp) for output filename")
     p.add_argument("--out", default=None, help="Optional CSV to save trade history (auto if omitted)")
     return p.parse_args(argv)
 
@@ -410,37 +449,57 @@ def main(argv: Optional[List[str]] = None) -> int:
         data_path=args.data,
         start_local=args.from_s,
         end_local=args.to_s,
-        tick_size=args.tick,
+        price_gap=args.price_gap,
         first_ladder_price=args.first_ladder_price,
         maker_fee=args.maker_fee,
         ladder_rungs=args.ladder_rungs,
         order_krw=args.order_krw,
         min_order_krw=args.min_order_krw,
-        qty_unit=args.qty_unit,
+        # qty_unit=args.qty_unit,
         tz='Asia/Seoul',
     )
 
     if not hist.empty:
-        print(hist.head(30).to_string(index=False))
+        preview = hist.head(30).copy()
+        formatters = {}
+        if "qty" in preview.columns:
+            formatters["qty"] = lambda x: f"{x:.8f}"
+        if "inventory_qty_after" in preview.columns:
+            formatters["inventory_qty_after"] = lambda x: f"{x:.8f}"
+        print(preview.to_string(index=False, formatters=formatters))
     else:
         print("No events generated.")
     print(
-        f"\nSummary: realized={metrics['realized_pnl_krw']:.2f} KRW, unrealized={metrics['unrealized_pnl_krw']:.2f} KRW, total={metrics['total_pnl_krw']:.2f} KRW, end_inventory_qty={metrics['end_inventory_qty']:.4f}"
+        f"\nSummary: realized={metrics['realized_pnl_krw']:.2f} KRW, unrealized={metrics['unrealized_pnl_krw']:.2f} KRW, total={metrics['total_pnl_krw']:.2f} KRW, end_inventory_qty={metrics['end_inventory_qty']:.8f}"
     )
 
     out_path = args.out
     if out_path is None:
-        from_token = args.from_s.replace(":", "_")
-        to_token = args.to_s.replace(":", "_")
+        # Determine symbol
+        symbol = args.symbol
+        if symbol is None:
+            # Try to infer from data path like .../krw-xrp_...
+            base = os.path.basename(args.data).lower()
+            token = None
+            for part in base.replace(".csv.gz", "").split("_"):
+                if "-" in part:
+                    dash_parts = part.split("-")
+                    if len(dash_parts) == 2 and dash_parts[0] in ("krw", "usd", "usdt", "btc"):
+                        token = dash_parts[1]
+                        break
+            symbol = token or "xrp"
+        # Build filename: trade_result_{symbol}_{ladder}_{tick}_{from}_{to}.csv
+        from_token = args.from_s
+        to_token = args.to_s
         ladder_token = str(int(round(args.first_ladder_price)))
         base_dir = os.path.dirname(os.path.abspath(args.data))
         out_path = os.path.join(
             base_dir,
-            f"trade_history_tick{args.tick}_ladder{ladder_token}_{from_token}_{to_token}.csv",
+            f"trade_result_{symbol}_{ladder_token}_{args.price_gap}_{from_token}_{to_token}.csv",
         )
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    hist.to_csv(out_path, index=False)
+    hist.to_csv(out_path, index=False, float_format="%.8f")
     print(f"Saved trade history to {out_path}")
 
     return 0
