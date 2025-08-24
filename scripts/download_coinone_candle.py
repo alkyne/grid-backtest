@@ -12,21 +12,14 @@ Examples:
     --to 25-08-22_23:00 \
     --out data/coinone/btc_1m_23-11-01_2314_25-08-22_2300.csv.gz
 
-  # 5m candles for XRP/KRW using shorthand ticker (defaults quote to KRW)
-  python scripts/download_coinone_candle.py \
-    --ticker XRP \
-    --interval 5m \
-    --from 24-01-01_00:00 \
-    --to 24-01-02_00:00
-
   # Split output by KST month for incremental storage
   python scripts/download_coinone_candle.py \
     --ticker USDT \
-    --interval 1m \
-    --from 23-11-01_00:00 \
-    --to 24-02-01_00:00 \
+    --interval 5m \
+    --from 23-11-29_00:00 \
+    --to 25-08-24_00:00 \
     --split-monthly \
-    --out-dir data/coinone/monthly
+    --out-dir data/coinone/usdt/5m
 
 Notes:
 - All input times are interpreted as KST (UTC+9). Output includes both timestamp_kst and timestamp_utc.
